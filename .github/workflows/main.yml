@@ -1,4 +1,4 @@
-name: Secure RDP (XFCE4 on Linux) - Debuggable
+name: Linux-XFCE-RDP
 
 on:
   workflow_dispatch:
@@ -9,160 +9,54 @@ jobs:
     timeout-minutes: 3600
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    - name: Install XFCE Desktop Environment and XRDP
+      run: |
+        sudo apt update
+        sudo apt install -y xfce4 xfce4-goodies xrdp
+        sudo systemctl enable xrdp
 
-      - name: Install XFCE4, Xorg, xrdp and prerequisites (no netcat)
-        run: |
-          sudo apt-get update -y
-          # install xrdp + xorgxrdp to ensure good compatibility with XFCE
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies xorg dbus-x11 xrdp xorgxrdp curl openssl
-          sudo systemctl enable --now xrdp
+    - name: Configure XRDP to use XFCE
+      run: |
+        echo "startxfce4" | sudo tee /etc/xrdp/startwm.sh
+        sudo systemctl restart xrdp
 
-      - name: Create user AiraaCheisyaa with secure password (fixed)
-        run: |
-          set -euo pipefail
-          USERNAME="AiraaCheisyaa"
-          PASSLEN=16
-          MINLEN=12
+    - name: Create RDP User with Secure Password
+      run: |
+        password=$(openssl rand -base64 12)
+        sudo useradd -m -s /bin/bash airaacheisyaa
+        echo "AiraaCheisyaa:$password" | sudo chpasswd
+        sudo adduser airaacheisyaa sudo
+        sudo adduser airaacheisyaa xrdp
+        echo "RDP_CREDS=User: airaacheisyaa | Password: $password" >> $GITHUB_ENV
+        echo "RDP_PASSWORD=$password" >> $GITHUB_ENV
 
-          if id "$USERNAME" >/dev/null 2>&1; then
-            echo "User $USERNAME already exists - resetting password"
-          else
-            echo "Creating user $USERNAME"
-            sudo useradd -m -s /bin/bash -G sudo "$USERNAME"
-          fi
+    - name: Install Tailscale
+      run: |
+        curl -fsSL https://tailscale.com/install.sh | sh
 
-          PASSWORD=""
-          if command -v openssl >/dev/null 2>&1; then
-            PASSWORD=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9!@#$%&*()-_=+[]{}:;,.?/' | head -c ${PASSLEN} || true)
-          fi
+    - name: Establish Tailscale Connection
+      run: |
+        sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$GITHUB_RUN_ID
+        ts_ip=$(sudo tailscale ip -4)
+        echo "TAILSCALE_IP=$ts_ip" >> $GITHUB_ENV
 
-          if [ -z "${PASSWORD}" ] || [ "${#PASSWORD}" -lt "${MINLEN}" ]; then
-            PASSWORD=$(head -c 512 /dev/urandom | tr -dc 'A-Za-z0-9!@#$%&*()-_=+[]{}:;,.?/' | head -c ${PASSLEN} || true)
-          fi
+    - name: Verify RDP Accessibility
+      run: |
+        echo "Tailscale IP: $TAILSCALE_IP"
+        # Verifikasi bahwa port RDP (3389) dapat dijangkau
+        if nc -zv $TAILSCALE_IP 3389; then
+          echo "TCP connectivity successful!"
+        else
+          echo "TCP connection to RDP port 3389 failed"
+          exit 1
+        fi
 
-          if [ -z "${PASSWORD}" ] || [ "${#PASSWORD}" -lt "${MINLEN}" ]; then
-            PASSWORD="$(date +%s)X$(hostname | tr -dc 'a-zA-Z0-9' | head -c8)"
-          fi
-
-          echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
-          sudo usermod -aG sudo "$USERNAME" || true
-
-          # Ensure .xsession owned by user and contains startxfce4
-          sudo -H -u "$USERNAME" bash -lc 'mkdir -p ~/.config; echo "startxfce4" > ~/.xsession; chmod 644 ~/.xsession'
-
-          # Export credentials
-          echo "RDP_USER=${USERNAME}" >> $GITHUB_ENV
-          echo "RDP_PASS=${PASSWORD}" >> $GITHUB_ENV
-
-      - name: (Optional) Allow 3389 in UFW if available
-        run: |
-          if command -v ufw >/dev/null 2>&1; then
-            sudo ufw allow 3389/tcp || true
-          fi
-
-      - name: Install Tailscale
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sudo sh
-
-      - name: Bring up Tailscale and get Tailscale IP
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          if [ -z "${TAILSCALE_AUTH_KEY:-}" ]; then
-            echo "Missing TAILSCALE_AUTH_KEY secret. Please add it to repo secrets." >&2
-            exit 1
-          fi
-          HOSTNAME="gh-runner-${GITHUB_RUN_ID}"
-          sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname="${HOSTNAME}" || { echo "tailscale up failed" >&2; exit 1; }
-          # Get IPv4
-          TAILSCALE_IP=""
-          for i in $(seq 1 10); do
-            TAILSCALE_IP=$(tailscale ip -4 2>/dev/null | awk 'NR==1{print $1}' || true)
-            if [ -n "${TAILSCALE_IP}" ]; then break; fi
-            sleep 2
-          done
-          if [ -z "${TAILSCALE_IP}" ]; then
-            echo "Tailscale IP not assigned. Exiting." >&2
-            exit 1
-          fi
-          echo "TAILSCALE_IP=${TAILSCALE_IP}" >> $GITHUB_ENV
-          echo "TAILSCALE_HOSTNAME=${HOSTNAME}" >> $GITHUB_ENV
-
-      - name: Debug xrdp / network (show listeners, logs) and wait for 3389 to listen
-        run: |
-          set -euo pipefail
-          echo "Restarting xrdp to ensure fresh state..."
-          sudo systemctl restart xrdp || true
-          sleep 2
-          echo "----- xrdp status -----"
-          sudo systemctl status xrdp --no-pager || true
-          echo "----- xrdp processes -----"
-          ps aux | egrep 'xrdp|sesman|Xorg' || true
-          echo "----- Listening TCP ports (look for 3389) -----"
-          sudo ss -ltnp | sed -n '1,200p' || true
-          echo "----- xrdp config -----"
-          sudo sed -n '1,200p' /etc/xrdp/xrdp.ini || true
-          echo "----- xrdp journal (last 200 lines) -----"
-          sudo journalctl -u xrdp --no-pager -n 200 || true
-          echo "----- tailscale status -----"
-          tailscale status || true
-          tailscale netcheck || true
-          echo "Waiting up to 30s for 3389 to appear LISTENING..."
-          ATTEMPTS=0
-          while [ $ATTEMPTS -lt 15 ]; do
-            if sudo ss -ltn | grep -q ':3389'; then
-              echo "Port 3389 is LISTENING"
-              sudo ss -ltnp | grep 3389 || true
-              break
-            fi
-            ATTEMPTS=$((ATTEMPTS+1))
-            echo "Still not listening ($ATTEMPTS). sleeping 2s..."
-            sleep 2
-          done
-          if ! sudo ss -ltn | grep -q ':3389'; then
-            echo "ERROR: xrdp does not appear to be listening on 3389 after retries." >&2
-            # print xrdp logs again for diagnosis
-            sudo journalctl -u xrdp --no-pager -n 400 || true
-            exit 1
-          fi
-
-      - name: Verify RDP (xrdp) accessibility over Tailscale using /dev/tcp
-        run: |
-          set -euo pipefail
-          # source GITHUB_ENV if available
-          if [ -f "$GITHUB_ENV" ]; then source "$GITHUB_ENV"; fi
-          if [ -z "${TAILSCALE_IP:-}" ]; then
-            echo "TAILSCALE_IP is empty or not set. Aborting." >&2
-            exit 1
-          fi
-          echo "Testing connectivity to ${TAILSCALE_IP}:3389"
-          if timeout 8 bash -c "cat < /dev/tcp/${TAILSCALE_IP}/3389" >/dev/null 2>&1; then
-            echo "TCP connectivity to port 3389 succeeded"
-          else
-            echo "TCP connection to RDP port 3389 failed" >&2
-            echo "Dumping diagnostics:"
-            echo "----- ss -ltnp -----"; sudo ss -ltnp || true
-            echo "----- iptables (filter) -----"; sudo iptables -L -n -v || true
-            echo "----- ufw status -----"; if command -v ufw >/dev/null 2>&1; then sudo ufw status || true; fi
-            echo "----- xrdp journal -----"; sudo journalctl -u xrdp --no-pager -n 200 || true
-            exit 1
-          fi
-
-      - name: Maintain Connection and display access info
-        run: |
-          set -euo pipefail
-          source $GITHUB_ENV || true
-          echo
-          echo "=== RDP ACCESS ==="
-          echo "Address: ${TAILSCALE_IP}"
-          echo "Username: ${RDP_USER:-}"
-          echo "Password: ${RDP_PASS:-}"
-          echo "=================="
-          while true; do
-            echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] RDP Active - Use Cancel Workflow in Actions UI to terminate"
-            sleep 300
-          done
+    - name: Maintain Connection
+      run: |
+        echo "=== RDP ACCESS ==="
+        echo "Address: $TAILSCALE_IP"
+        echo "Username: AiraaCheisyaa"
+        echo "Password: ${{ env.RDP_PASSWORD }}"
+        echo "=================="
+        # Jaga agar runner tetap aktif
+        sleep infinity
