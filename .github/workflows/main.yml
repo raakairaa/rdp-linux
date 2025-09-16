@@ -1,11 +1,259 @@
-name: yaml-syntax-check
+name: AiraaCheisyaa RDP (Linux - xrdp, final-fixed)
 
 on:
   workflow_dispatch:
+    inputs:
+      username:
+        description: 'Nama user RDP (default: airaacheisyaa)'
+        required: false
+        default: 'airaacheisyaa'
+      custom_password:
+        description: 'Custom password (optional). Jika ingin aman, set secret CUSTOM_RDP_PASSWORD instead.'
+        required: false
+        default: ''
+      auto_timeout_hours:
+        description: 'Auto shutdown setelah X jam (0 = disable)'
+        required: false
+        default: '6'
+      upload_artifact:
+        description: 'Upload credentials sebagai artifact (true/false)'
+        required: false
+        default: 'true'
+      cleanup_user:
+        description: 'Hapus user saat workflow selesai (true/false)'
+        required: false
+        default: 'false'
+      reveal_password:
+        description: 'Tampilkan password di logs (true = tampilkan). WARNING: insecure!'
+        required: false
+        default: 'true'
 
 jobs:
-  lint-test:
+  secure-rdp-linux:
     runs-on: ubuntu-latest
+    timeout-minutes: 1440
+
     steps:
-      - name: Say hi
-        run: echo "ok:workflow YAML accepted"
+      - name: Checkout repo (needed for artifact permissions)
+        uses: actions/checkout@v4
+
+      - name: Prepare & Create RDP user (generate or use custom password)
+        env:
+          USERNAME_INPUT: ${{ github.event.inputs.username }}
+          CUSTOM_INPUT: ${{ github.event.inputs.custom_password }}
+          CUSTOM_SECRET: ${{ secrets.CUSTOM_RDP_PASSWORD }}
+          REVEAL: ${{ github.event.inputs.reveal_password }}
+        run: |
+          set -euo pipefail
+          username="${USERNAME_INPUT}"
+          if [ -z "$username" ]; then username="airaacheisyaa"; fi
+
+          # decide password: prefer secret > workflow input > generated
+          if [ -n "${CUSTOM_SECRET:-}" ]; then
+            password="${CUSTOM_SECRET}"
+            echo "Using password from secret CUSTOM_RDP_PASSWORD (secret prioritized)"
+          elif [ -n "${CUSTOM_INPUT:-}" ]; then
+            password="${CUSTOM_INPUT}"
+            echo "Using password from workflow input custom_password"
+          else
+            password="$(openssl rand -base64 18)"
+            echo "No custom password provided — using generated password"
+          fi
+
+          # basic validation (warn only)
+          pass_len=${#password}
+          if [ "$pass_len" -lt 8 ]; then
+            echo "::warning::Password length is less than 8 characters (length: $pass_len). Consider stronger password."
+          fi
+
+          # create user if not exists and set password
+          if ! id "$username" >/dev/null 2>&1; then
+            sudo adduser --disabled-password --gecos "" "$username"
+          fi
+          echo "${username}:${password}" | sudo chpasswd
+          sudo usermod -aG sudo "$username" || true
+
+          # save creds to temp file (for artifact)
+          out="/tmp/rdp-credentials-${GITHUB_RUN_ID}.txt"
+          echo "Username: $username" > "$out"
+          echo "Password: $password" >> "$out"
+          echo "CreatedAt: $(date -u --iso-8601=seconds)" >> "$out"
+          echo "RDP_CREDS_FILE=$out" >> $GITHUB_ENV
+          echo "RDP_USERNAME=$username" >> $GITHUB_ENV
+
+          # optionally echo to actions log (insecure)
+          if [ "${REVEAL,,}" = "true" ]; then
+            echo "=== RDP CREDENTIALS (PLAINTEXT) ==="
+            echo "Username: $username"
+            echo "Password: $password"
+            echo "==================================="
+          else
+            echo "Password reveal disabled (reveal_password=false)"
+          fi
+
+      - name: install xrdp, xfce4-session, dbus-x11 & required components (fixed)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+
+          # install XFCE core, session, dbus-x11 and xrdp
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xfce4 xfce4-goodies xfce4-session dbus-x11 xorg xrdp netcat-openbsd curl openssl
+
+          # rewrite /etc/xrdp/startwm.sh to a clean failsafe launcher for xfce
+          sudo tee /etc/xrdp/startwm.sh > /dev/null <<'EOF'
+#!/bin/sh
+# xrdp startwm shim for xfce4 (failsafe)
+if [ -r /etc/default/locale ]; then
+  . /etc/default/locale
+  export LANG LANGUAGE
+fi
+export XDG_SESSION_TYPE=x11
+# unset DBUS runtime env to allow fresh session bus start
+unset DBUS_SESSION_BUS_ADDRESS
+unset XDG_RUNTIME_DIR
+exec startxfce4
+EOF
+          sudo chmod +x /etc/xrdp/startwm.sh
+
+          # Ensure XDG_CONFIG_DIRS contains /etc/xdg (helps xfce find its configs)
+          if ! grep -q '^XDG_CONFIG_DIRS=.*\/etc\/xdg' /etc/environment 2>/dev/null; then
+            echo "XDG_CONFIG_DIRS=/etc/xdg:\$XDG_CONFIG_DIRS" | sudo tee -a /etc/environment >/dev/null || true
+          fi
+
+          # reload and restart services
+          sudo systemctl daemon-reload || true
+          sudo systemctl restart dbus || true
+          sudo systemctl enable --now xrdp || true
+
+          # show some debug info
+          echo "---- startwm.sh content ----"
+          sudo sed -n '1,200p' /etc/xrdp/startwm.sh || true
+          echo "---- xfce4-session package info ----"
+          dpkg -l | grep xfce4-session || true
+          echo "---- xrdp status ----"
+          sudo systemctl status xrdp --no-pager || true
+
+      - name: Install Tailscale and bring up
+        env:
+          TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          set -euo pipefail
+          # install tailscale (official script)
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
+          sudo systemctl enable --now tailscaled || true
+          # bring up with authkey and unique hostname (may fail silently if key invalid)
+          sudo tailscale up --authkey="${TS_KEY}" --hostname="gh-runner-${GITHUB_RUN_ID}" || true
+
+      - name: Wait for Tailscale IP
+        run: |
+          set -euo pipefail
+          TAILSCALE_IP=""
+          retries=0
+          until [ -n "$TAILSCALE_IP" ] || [ $retries -ge 30 ]; do
+            TAILSCALE_IP="$(sudo tailscale ip -4 | awk 'NF{print $1; exit}')"
+            if [ -n "$TAILSCALE_IP" ]; then break; fi
+            retries=$((retries+1))
+            sleep 5
+          done
+          if [ -z "$TAILSCALE_IP" ]; then
+            echo "Tailscale IP tidak terassign. Keluar."
+            exit 1
+          fi
+          echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
+          echo "Found Tailscale IP: $TAILSCALE_IP"
+
+      - name: Verify RDP Accessibility (retries)
+        run: |
+          set -euo pipefail
+          ip="${TAILSCALE_IP}"
+          ok=0
+          tries=0
+          until [ $ok -eq 1 ] || [ $tries -ge 12 ]; do
+            if nc -z -w 5 "$ip" 3389 >/dev/null 2>&1; then
+              ok=1
+              break
+            fi
+            tries=$((tries+1))
+            echo "Port 3389 belum siap pada $ip — retry $tries/12"
+            sleep 10
+          done
+          if [ $ok -ne 1 ]; then
+            echo "TCP connection to RDP port 3389 failed. Exiting."
+            exit 1
+          fi
+          echo "TCP connectivity successful!"
+
+      - name: Upload credentials artifact (optional)
+        if: ${{ github.event.inputs.upload_artifact == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-credentials-${{ github.run_id }}
+          path: ${{ env.RDP_CREDS_FILE }}
+
+      - name: Main keep-alive & health loop
+        env:
+          TIMEOUT_HOURS: ${{ github.event.inputs.auto_timeout_hours }}
+          CLEANUP_USER: ${{ github.event.inputs.cleanup_user }}
+          USERNAME_INPUT: ${{ github.event.inputs.username }}
+        run: |
+          set -euo pipefail
+          timeout_hours=${TIMEOUT_HOURS:-6}
+          if [ "$timeout_hours" -eq 0 ]; then
+            end_epoch=0
+          else
+            end_epoch=$(( $(date +%s) + timeout_hours*3600 ))
+          fi
+          ip="${TAILSCALE_IP}"
+          username="${RDP_USERNAME}"
+
+          echo "Mulai keep-alive loop (ip: $ip, user: $username). Auto-timeout: $timeout_hours jam."
+
+          while true; do
+            now=$(date +%s)
+            if [ "$end_epoch" -ne 0 ] && [ "$now" -ge "$end_epoch" ]; then
+              echo "Auto-timeout tercapai. Keluar dari loop."
+              break
+            fi
+
+            if nc -z -w 5 "$ip" 3389 >/dev/null 2>&1; then
+              echo "[$(date -Iseconds)] RDP OK at $ip (user: $username)"
+            else
+              echo "[$(date -Iseconds)] RDP unreachable — mencoba restart layanan..."
+              sudo systemctl restart tailscaled || true
+              sudo systemctl restart xrdp || true
+              sleep 15
+            fi
+
+            sleep 60
+          done
+
+      - name: Optional cleanup (hapus user & cred file)
+        if: ${{ github.event.inputs.cleanup_user == 'true' }}
+        run: |
+          set -euo pipefail
+          username="${{ github.event.inputs.username }}"
+          if id "$username" >/dev/null 2>&1; then
+            echo "Menghapus user $username ..."
+            sudo deluser --remove-home "$username" || true
+          else
+            echo "User $username tidak ditemukan, skip delete."
+          fi
+          if [ -n "${RDP_CREDS_FILE:-}" ] && [ -f "${RDP_CREDS_FILE}" ]; then
+            sudo shred -u "${RDP_CREDS_FILE}" || rm -f "${RDP_CREDS_FILE}" || true
+          fi
+
+      - name: Show debug logs (always)
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "=== startwm.sh (for debugging) ==="
+          sudo sed -n '1,200p' /etc/xrdp/startwm.sh || true
+          echo "=== last 200 lines xrdp-sesman.log ==="
+          sudo tail -n 200 /var/log/xrdp-sesman.log || true
+          echo "=== last 200 lines auth.log ==="
+          sudo tail -n 200 /var/log/auth.log || true
+          echo "=== dbus & xrdp status ==="
+          sudo systemctl status dbus --no-pager || true
+          sudo systemctl status xrdp --no-pager || true
+          echo "=== End debug logs ==="
