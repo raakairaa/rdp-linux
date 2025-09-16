@@ -1,4 +1,4 @@
-name: Linux-XFCE-RDP
+name: Advanced-Linux-XFCE-RDP
 
 on:
   workflow_dispatch:
@@ -9,54 +9,120 @@ jobs:
     timeout-minutes: 3600
 
     steps:
-    - name: Install XFCE Desktop Environment and XRDP
+    - name: Install XFCE Desktop, XRDP and Verify
       run: |
-        sudo apt update
-        sudo apt install -y xfce4 xfce4-goodies xrdp
-        sudo systemctl enable xrdp
+        set -e
+        echo "Updating package lists..."
+        sudo apt-get update
+        echo "Installing desktop environment and RDP server..."
+        sudo apt-get install -y xfce4 xfce4-goodies xrdp
+        
+        echo "Verifying installation..."
+        dpkg -l xrdp > /dev/null || (echo "XRDP installation failed" && exit 1)
+        dpkg -l xfce4 > /dev/null || (echo "XFCE4 installation failed" && exit 1)
+        echo "Installation verified successfully."
 
-    - name: Configure XRDP to use XFCE
+    - name: Configure XRDP and Verify Service
       run: |
-        echo "startxfce4" | sudo tee /etc/xrdp/startwm.sh
+        set -e
+        echo "Configuring XRDP to use XFCE session..."
+        sudo sed -i.bak '/fi/a #xrdp multi-arch\nstartxfce4' /etc/xrdp/startwm.sh
+        
+        echo "Restarting XRDP service..."
         sudo systemctl restart xrdp
+        sleep 5 # Give the service a moment to initialize
+        
+        echo "Verifying XRDP service status..."
+        sudo systemctl status xrdp --no-pager || (echo "XRDP service failed to start" && exit 1)
+        echo "XRDP service is active."
 
-    - name: Create RDP User with Secure Password
+    - name: Create RDP User and Verify
       run: |
-        password=$(openssl rand -base64 12)
+        set -e
+        # Generate a strong, URL-safe password to avoid problematic characters
+        password=$(openssl rand -base64 16 | tr -d '\/\+=')
+        echo "Creating user AiraaCheisyaa..."
         sudo useradd -m -s /bin/bash AiraaCheisyaa
-        echo "AiraaCheisyaa:$password" | sudo chpasswd
+        
+        echo "Setting password for user AiraaCheisyaa..."
+        # Create a SHA-512 encrypted hash of the password and set it using usermod
+        # This is the most reliable method for scripts.
+        sudo usermod --password "$(echo "$password" | openssl passwd -6 -stdin)" AiraaCheisyaa
+
+        echo "Adding user to sudo and xrdp groups..."
         sudo adduser AiraaCheisyaa sudo
         sudo adduser AiraaCheisyaa xrdp
+
+        echo "Verifying user creation..."
+        id AiraaCheisyaa > /dev/null || (echo "User creation failed" && exit 1)
+        echo "User AiraaCheisyaa configured successfully."
+
         echo "RDP_CREDS=User: AiraaCheisyaa | Password: $password" >> $GITHUB_ENV
+        # Also save the password to a separate variable for easy access in later steps
         echo "RDP_PASSWORD=$password" >> $GITHUB_ENV
 
     - name: Install Tailscale
       run: |
+        set -e -o pipefail
+        echo "Installing Tailscale..."
         curl -fsSL https://tailscale.com/install.sh | sh
+        echo "Tailscale installed."
 
-    - name: Establish Tailscale Connection
+    - name: Establish Tailscale Connection with Retry
       run: |
+        set -e
+        echo "Bringing up Tailscale..."
         sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$GITHUB_RUN_ID
-        ts_ip=$(sudo tailscale ip -4)
-        echo "TAILSCALE_IP=$ts_ip" >> $GITHUB_ENV
+        
+        ts_ip=""
+        max_retries=10
+        retry_count=0
 
-    - name: Verify RDP Accessibility
-      run: |
-        echo "Tailscale IP: $TAILSCALE_IP"
-        # Verifikasi bahwa port RDP (3389) dapat dijangkau
-        if nc -zv $TAILSCALE_IP 3389; then
-          echo "TCP connectivity successful!"
-        else
-          echo "TCP connection to RDP port 3389 failed"
+        echo "Attempting to get Tailscale IP..."
+        while [ -z "$ts_ip" ] && [ $retry_count -lt $max_retries ]; do
+          ts_ip=$(sudo tailscale ip -4 || echo "")
+          if [ -z "$ts_ip" ]; then
+            retry_count=$((retry_count + 1))
+            echo "IP not assigned yet. Retrying in 5 seconds... (Attempt $retry_count/$max_retries)"
+            sleep 5
+          fi
+        done
+
+        if [ -z "$ts_ip" ]; then
+          echo "Error: Failed to get Tailscale IP after $max_retries attempts."
+          sudo tailscale status
           exit 1
         fi
+        
+        echo "Successfully obtained Tailscale IP: $ts_ip"
+        echo "TAILSCALE_IP=$ts_ip" >> $GITHUB_ENV
+
+    - name: Output Connection Details
+      run: |
+        echo "=========================================="
+        echo "          RDP ACCESS DETAILS"
+        echo "=========================================="
+        echo "Address:   ${{ env.TAILSCALE_IP }}"
+        echo "Username:  AiraaCheisyaa"
+        echo "Password:  ${{ env.RDP_PASSWORD }}"
+        echo "=========================================="
 
     - name: Maintain Connection
       run: |
-        echo "=== RDP ACCESS ==="
-        echo "Address: $TAILSCALE_IP"
-        echo "Username: AiraaCheisyaa"
-        echo "Password: ${{ env.RDP_PASSWORD }}"
-        echo "=================="
-        # Jaga agar runner tetap aktif
+        echo "Connection established. Runner will remain active."
         sleep infinity
+        
+    - name: Debug on Failure
+      if: failure()
+      run: |
+        echo "An error occurred. Collecting diagnostic information..."
+        echo "--- XRDP Service Status ---"
+        sudo systemctl status xrdp --no-pager || echo "Could not get XRDP status."
+        echo "--- XRDP Journal Logs (last 100 lines) ---"
+        sudo journalctl -u xrdp -n 100 --no-pager || echo "Could not get XRDP journal."
+        echo "--- Tailscale Status ---"
+        sudo tailscale status || echo "Could not get Tailscale status."
+        echo "--- Network Configuration ---"
+        ip addr
+        echo "--- Listening Ports ---"
+        sudo ss -tuln
