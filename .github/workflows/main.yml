@@ -1,4 +1,4 @@
-name: Secure RDP (XFCE4 on Linux) - Opsi B
+name: Secure RDP (XFCE4 on Linux) - Opsi B (fix password generation)
 
 on:
   workflow_dispatch:
@@ -16,16 +16,17 @@ jobs:
         run: |
           sudo apt-get update -y
           # Install XFCE4 desktop, xrdp and required packages (no netcat)
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies xorg dbus-x11 xrdp curl
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies xorg dbus-x11 xrdp curl openssl
           # Ensure xrdp is enabled and running
           sudo systemctl enable --now xrdp
 
-      - name: Create user AiraaCheisyaa with secure password
+      - name: Create user AiraaCheisyaa with secure password (fixed)
         run: |
           set -euo pipefail
           USERNAME="AiraaCheisyaa"
+          MINLEN=12
+          PASSLEN=16
 
-          # If user already exists, skip creation (but update password)
           if id "$USERNAME" >/dev/null 2>&1; then
             echo "User $USERNAME already exists - resetting password"
           else
@@ -33,21 +34,33 @@ jobs:
             sudo useradd -m -s /bin/bash -G sudo "$USERNAME"
           fi
 
-          # Generate a strong password: 4 upper, 4 lower, 4 digits, 4 special, then shuffle
-          UPPER=$(tr -dc 'A-Z' </dev/urandom | head -c4)
-          LOWER=$(tr -dc 'a-z' </dev/urandom | head -c4)
-          NUMS=$(tr -dc '0-9' </dev/urandom | head -c4)
-          SPECIAL=$(tr -dc '!@#$%&*()-_=+[]{}:;,.?/' </dev/urandom | head -c4)
-          PASSWORD="$(echo "${UPPER}${LOWER}${NUMS}${SPECIAL}" | fold -w1 | shuf | tr -d '\n')"
+          # Try openssl-based password generation first (robust)
+          PASSWORD=""
+          if command -v openssl >/dev/null 2>&1; then
+            PASSWORD=$(openssl rand -base64 48 2>/dev/null | tr -dc 'A-Za-z0-9!@#$%&*()-_=+[]{}:;,.?/' | head -c ${PASSLEN} || true)
+          fi
 
-          # Set password and ensure user in sudo group
+          # Fallback if openssl not available or output too short
+          if [ -z "${PASSWORD}" ] || [ "${#PASSWORD}" -lt "${MINLEN}" ]; then
+            echo "openssl not available or produced short password — using /dev/urandom fallback"
+            # Use head to read a finite chunk then tr (avoids SIGPIPE issues)
+            PASSWORD=$(head -c 512 /dev/urandom | tr -dc 'A-Za-z0-9!@#$%&*()-_=+[]{}:;,.?/' | head -c ${PASSLEN} || true)
+          fi
+
+          # Final safety: if still short, build a deterministic fallback (guaranteed)
+          if [ -z "${PASSWORD}" ] || [ "${#PASSWORD}" -lt "${MINLEN}" ]; then
+            echo "All generation methods failed or returned short password — using deterministic fallback"
+            # deterministic fallback (not ideal but ensures workflow proceeds)
+            PASSWORD="$(date +%s)X$(hostname | tr -dc 'a-zA-Z0-9' | head -c8)"
+          fi
+
+          # Apply password, add to sudo group and configure XFCE session
           echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
           sudo usermod -aG sudo "$USERNAME" || true
 
-          # Configure XFCE session for the user so xrdp will start XFCE
           sudo -H -u "$USERNAME" bash -lc 'mkdir -p ~/.config && echo "startxfce4" > ~/.xsession && chmod 644 ~/.xsession'
 
-          # Expose credentials to subsequent steps via GITHUB_ENV (separate variables)
+          # Export credentials safely to GITHUB_ENV (use separate vars)
           echo "RDP_USER=${USERNAME}" >> $GITHUB_ENV
           echo "RDP_PASS=${PASSWORD}" >> $GITHUB_ENV
 
@@ -106,14 +119,12 @@ jobs:
       - name: Verify RDP (xrdp) accessibility over Tailscale using /dev/tcp
         run: |
           set -euo pipefail
-          # GitHub exports variables set in previous steps, so we can read $TAILSCALE_IP directly
           if [ -z "${TAILSCALE_IP:-}" ]; then
             echo "TAILSCALE_IP is empty or not set. Aborting." >&2
             exit 1
           fi
           echo "Testing connectivity to ${TAILSCALE_IP}:3389"
 
-          # Test using bash /dev/tcp (timeout 5s)
           if timeout 5 bash -c "cat < /dev/tcp/${TAILSCALE_IP}/3389" >/dev/null 2>&1; then
             echo "TCP connectivity to port 3389 succeeded"
           else
@@ -124,16 +135,13 @@ jobs:
       - name: Maintain Connection and display access info
         run: |
           set -euo pipefail
-          # Use exported env vars directly
           echo
           echo "=== RDP ACCESS ==="
           echo "Address: ${TAILSCALE_IP}"
           echo "Username: ${RDP_USER:-}"
-          # Do not print password in CI logs if you prefer privacy; we print here because original workflow printed creds
           echo "Password: ${RDP_PASS:-}"
           echo "=================="
           echo ""
-          # Keep the job alive so the runner remains available (cancel workflow to stop)
           while true; do
             echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] RDP Active - Use Cancel Workflow in Actions UI to terminate"
             sleep 300
