@@ -23,11 +23,11 @@ jobs:
     - name: Create RDP User with Secure Password
       run: |
         password=$(openssl rand -base64 12)
-        sudo useradd -m -s /bin/bash airaacheisyaa
+        sudo useradd -m -s /bin/bash AiraaCheisyaa
         echo "AiraaCheisyaa:$password" | sudo chpasswd
-        sudo adduser airaacheisyaa sudo
-        sudo adduser airaacheisyaa xrdp
-        echo "RDP_CREDS=User: airaacheisyaa | Password: $password" >> $GITHUB_ENV
+        sudo adduser AiraaCheisyaa sudo
+        sudo adduser AiraaCheisyaa xrdp
+        echo "RDP_CREDS=User: AiraaCheisyaa | Password: $password" >> $GITHUB_ENV
         echo "RDP_PASSWORD=$password" >> $GITHUB_ENV
 
     - name: Install Tailscale
