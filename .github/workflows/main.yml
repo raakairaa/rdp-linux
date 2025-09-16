@@ -1,4 +1,4 @@
-name: AiraaRDP-Linux
+name: Secure RDP (XFCE4 on Linux) - Opsi B
 
 on:
   workflow_dispatch:
@@ -12,11 +12,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install XFCE4, Xorg, xrdp and prerequisites
+      - name: Install XFCE4, Xorg, xrdp and prerequisites (no netcat)
         run: |
           sudo apt-get update -y
-          # Install XFCE4 desktop, xrdp, and netcat for connectivity tests
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies xorg dbus-x11 xrdp netcat
+          # Install XFCE4 desktop, xrdp and required packages (no netcat)
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies xorg dbus-x11 xrdp curl
           # Ensure xrdp is enabled and running
           sudo systemctl enable --now xrdp
 
@@ -25,6 +25,14 @@ jobs:
           set -euo pipefail
           USERNAME="AiraaCheisyaa"
 
+          # If user already exists, skip creation (but update password)
+          if id "$USERNAME" >/dev/null 2>&1; then
+            echo "User $USERNAME already exists - resetting password"
+          else
+            echo "Creating user $USERNAME"
+            sudo useradd -m -s /bin/bash -G sudo "$USERNAME"
+          fi
+
           # Generate a strong password: 4 upper, 4 lower, 4 digits, 4 special, then shuffle
           UPPER=$(tr -dc 'A-Z' </dev/urandom | head -c4)
           LOWER=$(tr -dc 'a-z' </dev/urandom | head -c4)
@@ -32,18 +40,18 @@ jobs:
           SPECIAL=$(tr -dc '!@#$%&*()-_=+[]{}:;,.?/' </dev/urandom | head -c4)
           PASSWORD="$(echo "${UPPER}${LOWER}${NUMS}${SPECIAL}" | fold -w1 | shuf | tr -d '\n')"
 
-          # Create the user, set password, add to sudo group
-          sudo useradd -m -s /bin/bash -G sudo "$USERNAME" || true
+          # Set password and ensure user in sudo group
           echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
-          sudo usermod -aG sudo "$USERNAME"
+          sudo usermod -aG sudo "$USERNAME" || true
 
           # Configure XFCE session for the user so xrdp will start XFCE
-          sudo -H -u "$USERNAME" bash -lc 'echo "startxfce4" > ~/.xsession && chmod 644 ~/.xsession'
+          sudo -H -u "$USERNAME" bash -lc 'mkdir -p ~/.config && echo "startxfce4" > ~/.xsession && chmod 644 ~/.xsession'
 
-          # Expose credentials to subsequent steps via GITHUB_ENV
-          echo "RDP_CREDS=User: ${USERNAME} | Password: ${PASSWORD}" >> $GITHUB_ENV
+          # Expose credentials to subsequent steps via GITHUB_ENV (separate variables)
+          echo "RDP_USER=${USERNAME}" >> $GITHUB_ENV
+          echo "RDP_PASS=${PASSWORD}" >> $GITHUB_ENV
 
-          # Quick sanity check that user exists
+          # Sanity check
           if ! id "$USERNAME" >/dev/null 2>&1; then
             echo "User creation failed" >&2
             exit 1
@@ -51,7 +59,6 @@ jobs:
 
       - name: (Optional) Allow 3389 in UFW if available
         run: |
-          # On many runners UFW isn't active, but try to allow 3389 if ufw exists
           if command -v ufw >/dev/null 2>&1; then
             sudo ufw allow 3389/tcp || true
           fi
@@ -73,8 +80,8 @@ jobs:
             exit 1
           fi
 
-          # Use a recognizable hostname
           HOSTNAME="gh-runner-${GITHUB_RUN_ID}"
+          # Start tailscale with provided auth key
           sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname="${HOSTNAME}" || {
             echo "tailscale up failed" >&2
             exit 1
@@ -96,19 +103,18 @@ jobs:
           echo "TAILSCALE_IP=${TAILSCALE_IP}" >> $GITHUB_ENV
           echo "TAILSCALE_HOSTNAME=${HOSTNAME}" >> $GITHUB_ENV
 
-      - name: Verify RDP (xrdp) accessibility over Tailscale
+      - name: Verify RDP (xrdp) accessibility over Tailscale using /dev/tcp
         run: |
           set -euo pipefail
-          # read the env value we set earlier
-          if ! grep -q '^TAILSCALE_IP=' $GITHUB_ENV; then
-            echo "TAILSCALE_IP not found in GITHUB_ENV" >&2
+          # GitHub exports variables set in previous steps, so we can read $TAILSCALE_IP directly
+          if [ -z "${TAILSCALE_IP:-}" ]; then
+            echo "TAILSCALE_IP is empty or not set. Aborting." >&2
             exit 1
           fi
-          # shellcheck disable=SC1090
-          source $GITHUB_ENV
           echo "Testing connectivity to ${TAILSCALE_IP}:3389"
-          # netcat test (timeout 5s)
-          if nc -z -w5 "${TAILSCALE_IP}" 3389; then
+
+          # Test using bash /dev/tcp (timeout 5s)
+          if timeout 5 bash -c "cat < /dev/tcp/${TAILSCALE_IP}/3389" >/dev/null 2>&1; then
             echo "TCP connectivity to port 3389 succeeded"
           else
             echo "TCP connection to RDP port 3389 failed" >&2
@@ -118,17 +124,13 @@ jobs:
       - name: Maintain Connection and display access info
         run: |
           set -euo pipefail
-          # read env values
-          source $GITHUB_ENV || true
+          # Use exported env vars directly
           echo
           echo "=== RDP ACCESS ==="
           echo "Address: ${TAILSCALE_IP}"
-          # Show username and password from RDP_CREDS
-          if grep -q '^RDP_CREDS=' $GITHUB_ENV; then
-            grep '^RDP_CREDS=' $GITHUB_ENV | sed 's/^RDP_CREDS=//'
-          else
-            echo "RDP_CREDS not found"
-          fi
+          echo "Username: ${RDP_USER:-}"
+          # Do not print password in CI logs if you prefer privacy; we print here because original workflow printed creds
+          echo "Password: ${RDP_PASS:-}"
           echo "=================="
           echo ""
           # Keep the job alive so the runner remains available (cancel workflow to stop)
