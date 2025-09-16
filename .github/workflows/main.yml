@@ -8,4 +8,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Say hi
-        run: echo "ok: workflow YAML accepted"
+        run: echo "ok:workflow YAML accepted"
